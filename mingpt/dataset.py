@@ -104,13 +104,105 @@ class ParallelCopyDataset(Dataset):
         # the transformer starts making predictions at the last input element
         return self.length * 2
 
-    def get_local_mask(self, length):
+    def _get_local_mask(self, length):
         if self.thread_mask_type == 'causal':
             return torch.tril(torch.ones(length, length))
         elif self.thread_mask_type == 'non_causal':
             return torch.ones(length, length)
         elif self.thread_mask_type == 'independent':
             return torch.eye(length)
+        
+    def _get_output_seq_segments(self, input_seq):
+        """
+        output is the later part of the input sequence
+        In the example it's sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
+        segments: [sep, s0, s1], [t0, t1], [t2, s0, s1], [t3, t4], [t5]
+        """
+        sep_id = self.num_digits
+        thread_tokens = torch.arange(sep_id + 1, sep_id + 1 + self.extra_threads, dtype=torch.long)
+        output_segments = []
+        pos = 0
+        while pos < self.length:
+            inp_tokens = input_seq[pos:pos + self.num_threads]
+            if pos == 0:
+                inp_tokens = torch.cat((torch.tensor([sep_id], dtype=torch.long), inp_tokens))
+            output_segments.extend([thread_tokens, inp_tokens])
+            pos += self.num_threads
+        return output_segments
+
+    # Helper function to generate full_seq
+    def _generate_full_seq(self, input_seq):
+        """ 
+        input_seq: t0 t1 t2 t3 t4 t5 t6
+        output:    sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
+        full_seq = input_seq + output
+        """
+        output_segments = self._get_output_seq_segments(input_seq)
+        output = torch.cat(output_segments)
+        return torch.cat((input_seq, output))
+
+    # Helper function to generate full_seq_pos
+    def _generate_full_seq_pos(self):
+        """
+        input_seq_pos: 0  1  2  3  4  5  6
+        output_seq_pos: 7  8  9  8  9  10 11 12 11 12 13
+        output_segments_pos: [7, 8, 9], [8, 9], [10, 11, 12], [11, 12], [13]
+        """
+        input_seq_pos = torch.arange(self.length, dtype=torch.long)
+        output_segments_pos = []
+        pos = self.length
+        ptr = 0
+        while ptr < self.length:
+            thread_pos = torch.arange(pos, pos + self.num_threads, dtype=torch.long)
+            input_pos = torch.arange(pos + 1, pos + self.num_threads, dtype=torch.long)
+            output_segments_pos.extend([thread_pos, input_pos])
+            pos += self.num_threads
+            ptr += self.num_threads
+        output_pos = torch.cat(output_segments_pos)
+        return torch.cat((input_seq_pos, output_pos))
+
+    # Helper function to generate full_label_seq
+    def _generate_full_label_seq(self, input_seq):
+        """ 
+        label_input_seq: -1 -1 -1 -1 -1 -1 -1
+        label_output_seq: t0 t1 t2 t1 t2 t3 t4 t5 t4 t5 t6
+        label_output_segments: [t0, t1, t2], [t1, t2], [t3, t4, t5], [t4, t5]
+        """
+        label_input_seq = torch.full_like(input_seq, fill_value=-1)
+        label_output_segments = []
+        ptr = 0
+        while ptr < self.length:
+            thread_labels = input_seq[ptr:ptr + self.num_threads]
+            input_labels = input_seq[ptr + 1:ptr + self.num_threads]
+            label_output_segments.extend([thread_labels, input_labels])
+            ptr += self.num_threads
+        label_output_seq = torch.cat(label_output_segments)
+        return torch.cat((label_input_seq, label_output_seq))
+
+    def _generate_thread_mask(self, input_seq):
+        """ 
+        create a mask that allows each thread to attend to the correct tokens
+        - start with causal mask for all tokens
+        - then ensure that no token attends backward to special tokens outside of the local decoding group
+        - for the local decoding groups select the mask type based on the thread_mask_type parameter
+        """
+        sep_id = self.num_digits
+        thread_tokens = torch.arange(sep_id + 1, sep_id + 1 + self.extra_threads, dtype=torch.long)
+        output_segments = self._get_output_seq_segments(input_seq)
+        full_seq_length = input_seq.size(0) + torch.cat(output_segments).size(0)
+        start_mask = torch.tril(torch.ones(full_seq_length, full_seq_length))
+        pos = 0
+        for segment in output_segments:
+            segment_length = segment.size(0)
+            if thread_tokens[0] in segment:
+                start_mask[pos + segment_length:, pos:pos + segment_length] = 0
+                local_mask = self._get_local_mask(segment_length)
+                try:
+                    start_mask[pos - 1:pos + segment_length, pos - 1:pos + segment_length] = local_mask
+                except:
+                    import ipdb; ipdb.set_trace()
+            pos += segment_length
+        return start_mask
 
     def __getitem__(self, idx):
         while True:
@@ -126,104 +218,9 @@ class ParallelCopyDataset(Dataset):
             if inp_split == self.split:
                 break # ok
 
-        def get_output_seq_segments(input_seq):
-            """
-            output is the later part of the input sequence
-            In the example it's sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
-            segments: [sep, s0, s1], [t0, t1], [t2, s0, s1], [t3, t4], [t5]
-            """
-            sep_id = self.num_digits
-            thread_tokens = torch.arange(sep_id + 1, sep_id + 1 + self.extra_threads, dtype=torch.long)
-            output_segments = []
-            pos = 0
-            while pos < self.length:
-                inp_tokens = input_seq[pos:pos + self.num_threads]
-                if pos == 0:
-                    inp_tokens = torch.cat((torch.tensor([sep_id], dtype=torch.long), inp_tokens))
-                output_segments.extend([thread_tokens, inp_tokens])
-                pos += self.num_threads
-            return output_segments
-        
-        # Helper function to generate full_seq
-        def generate_full_seq(input_seq):
-            """ 
-            input_seq: t0 t1 t2 t3 t4 t5 t6
-            output:    sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
-            full_seq = input_seq + output
-            """
-            output_segments = get_output_seq_segments(input_seq)
-            output = torch.cat(output_segments)
-            return torch.cat((input_seq, output))
+        full_seq = self._generate_full_seq(input_seq)
+        full_seq_pos = self._generate_full_seq_pos()
+        full_label_seq = self._generate_full_label_seq(input_seq)
+        attn_mask = self._generate_thread_mask(input_seq)
 
-        # Helper function to generate full_seq_pos
-        def generate_full_seq_pos():
-            """
-            input_seq_pos: 0  1  2  3  4  5  6
-            output_seq_pos: 7  8  9  8  9  10 11 12 11 12 13
-            output_segments_pos: [7, 8, 9], [8, 9], [10, 11, 12], [11, 12], [13]
-            """
-            input_seq_pos = torch.arange(self.length, dtype=torch.long)
-            output_segments_pos = []
-            pos = self.length
-            ptr = 0
-            while ptr < self.length:
-                thread_pos = torch.arange(pos, pos + self.num_threads, dtype=torch.long)
-                input_pos = torch.arange(pos + 1, pos + self.num_threads, dtype=torch.long)
-                output_segments_pos.extend([thread_pos, input_pos])
-                pos += self.num_threads
-                ptr += self.num_threads
-            output_pos = torch.cat(output_segments_pos)
-            return torch.cat((input_seq_pos, output_pos))
-
-        # Helper function to generate full_label_seq
-        def generate_full_label_seq(input_seq):
-            """ 
-            label_input_seq: -1 -1 -1 -1 -1 -1 -1
-            label_output_seq: t0 t1 t2 t1 t2 t3 t4 t5 t4 t5 t6
-            label_output_segments: [t0, t1, t2], [t1, t2], [t3, t4, t5], [t4, t5]
-            """
-            label_input_seq = torch.full_like(input_seq, fill_value=-1)
-            label_output_segments = []
-            ptr = 0
-            while ptr < self.length:
-                thread_labels = input_seq[ptr:ptr + self.num_threads]
-                input_labels = input_seq[ptr + 1:ptr + self.num_threads]
-                label_output_segments.extend([thread_labels, input_labels])
-                ptr += self.num_threads
-            label_output_seq = torch.cat(label_output_segments)
-            return torch.cat((label_input_seq, label_output_seq))
-        
-        def generate_thread_mask(input_seq):
-            """ 
-            create a mask that allows each thread to attend to the correct tokens
-            - start with causal mask for all tokens
-            - then ensure that no token attends backward to special tokens outside of the local decoding group
-            - for the local decoding groups select the mask type based on the thread_mask_type parameter
-            """
-            sep_id = self.num_digits
-            thread_tokens = torch.arange(sep_id + 1, sep_id + 1 + self.extra_threads, dtype=torch.long)
-            output_segments = get_output_seq_segments(input_seq)
-            full_seq_length = input_seq.size(0) + torch.cat(output_segments).size(0)
-            start_mask = torch.tril(torch.ones(full_seq_length, full_seq_length))
-            pos = 0
-            for segment in output_segments:
-                segment_length = segment.size(0)
-                if thread_tokens[0] in segment:
-                    start_mask[pos + segment_length:, pos:pos + segment_length] = 0
-                    local_mask = self.get_local_mask(segment_length)
-                    start_mask[pos - 1:pos + segment_length, pos - 1:pos + segment_length] = local_mask
-                pos += segment_length
-            return start_mask
-            
-        full_seq = generate_full_seq(input_seq)
-        full_seq_pos = generate_full_seq_pos()
-        full_label_seq = generate_full_label_seq(input_seq)
-        attn_mask = generate_thread_mask(input_seq)
-
-        x = full_seq[:-1].clone()
-        x_pos = full_seq_pos[:-1].clone()
-        y = full_label_seq[1:].clone()
-        
-        # we only want to predict at output locations, mask out the loss at the input locations
-        y[:self.length] = -1
-        return (x, x_pos, attn_mask), y
+        return (full_seq, full_seq_pos, attn_mask), full_label_seq
