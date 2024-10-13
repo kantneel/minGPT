@@ -52,19 +52,19 @@ class CopyDataset(Dataset):
 class ParallelCopyDataset(Dataset):
     """ 
     Parallel Copy Task: copy an input sequence using multiple decoding tokens per forward pass
-    The tra
+    Produces input, labels, sequence positions and attention mask
     
     ** Example **
     seq_len = 7, num_threads = 3
     input tokens:   t0 t1 t2 t3 t4 t5 t6
     special tokens: s0 s1 (and sep)
     
-    input:        t0 t1 t2 t3 t4 t5 t6    sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
-    output:       t1 t2 t3 t4 t5 t6 sep    t0 t1 t2 t1 t2 t3 t4 t5 t4 t5 t6
-    loss mask:    0  0  0  0  0  0  0      1  1  1  1  1  1  1  1  1  1  1  
-    attn mask:    1  1  1  1  1  1  1      1  0  0  1  1  1  0  0  1  1  1  
-    seq pos:      0  1  2  3  4  5  6      7  8  9  8  9  10 11 12 11 12 13 
-    thread id:    .  .  .  .  .  .  .      0  1  2  .  .  0  1  2  .  .  0  
+    input:        t0 t1 t2 t3 t4 t5 t6  sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
+    labels:       -1 -1 -1 -1 -1 -1 -1   t0 t1 t2 t1 t2 t3 t4 t5 t4 t5 t6
+    loss mask:    0  0  0  0  0  0  0    1  1  1  1  1  1  1  1  1  1  1  
+    attn mask:    1  1  1  1  1  1  1    1  0  0  1  1  1  0  0  1  1  1  
+    seq pos:      0  1  2  3  4  5  6    7  8  9  8  9  10 11 12 11 12 13 
+    thread id:    .  .  .  .  .  .  .    0  1  2  .  .  0  1  2  .  .  0  
     
     ** Explanation **
     The input has special tokens s0 and s1 which indicate that at the time of prediction,
@@ -102,7 +102,7 @@ class ParallelCopyDataset(Dataset):
         # the length of the sequence that will feed into transformer, 
         # containing concatenated input and the output, but -1 because
         # the transformer starts making predictions at the last input element
-        return self.length * 2 - 1
+        return self.length * 2
 
     def get_local_mask(self, length):
         if self.thread_mask_type == 'causal':
@@ -127,27 +127,44 @@ class ParallelCopyDataset(Dataset):
                 break # ok
 
         def get_output_seq_segments(input_seq):
+            """
+            output is the later part of the input sequence
+            In the example it's sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
+            segments: [sep, s0, s1], [t0, t1], [t2, s0, s1], [t3, t4], [t5]
+            """
             sep_id = self.num_digits
             thread_tokens = torch.arange(sep_id + 1, sep_id + 1 + self.extra_threads, dtype=torch.long)
-            output_segments = [torch.tensor([sep_id], dtype=torch.long)]
+            output_segments = []
             pos = 0
             while pos < self.length:
                 inp_tokens = input_seq[pos:pos + self.num_threads]
+                if pos == 0:
+                    inp_tokens = torch.cat((torch.tensor([sep_id], dtype=torch.long), inp_tokens))
                 output_segments.extend([thread_tokens, inp_tokens])
                 pos += self.num_threads
             return output_segments
         
         # Helper function to generate full_seq
         def generate_full_seq(input_seq):
+            """ 
+            input_seq: t0 t1 t2 t3 t4 t5 t6
+            output:    sep s0 s1 t0 t1 t2 s0 s1 t3 t4 t5
+            full_seq = input_seq + output
+            """
             output_segments = get_output_seq_segments(input_seq)
             output = torch.cat(output_segments)
             return torch.cat((input_seq, output))
 
         # Helper function to generate full_seq_pos
         def generate_full_seq_pos():
+            """
+            input_seq_pos: 0  1  2  3  4  5  6
+            output_seq_pos: 7  8  9  8  9  10 11 12 11 12 13
+            output_segments_pos: [7, 8, 9], [8, 9], [10, 11, 12], [11, 12], [13]
+            """
             input_seq_pos = torch.arange(self.length, dtype=torch.long)
-            output_segments_pos = [torch.tensor([self.length], dtype=torch.long)]
-            pos = self.length + 1
+            output_segments_pos = []
+            pos = self.length
             ptr = 0
             while ptr < self.length:
                 thread_pos = torch.arange(pos, pos + self.num_threads, dtype=torch.long)
@@ -160,19 +177,29 @@ class ParallelCopyDataset(Dataset):
 
         # Helper function to generate full_label_seq
         def generate_full_label_seq(input_seq):
-            sep_id = self.num_digits
-            label_input_seq = torch.cat((input_seq[1:], torch.tensor([sep_id], dtype=torch.long)))
-            label_segments = []
+            """ 
+            label_input_seq: -1 -1 -1 -1 -1 -1 -1
+            label_output_seq: t0 t1 t2 t1 t2 t3 t4 t5 t4 t5 t6
+            label_output_segments: [t0, t1, t2], [t1, t2], [t3, t4, t5], [t4, t5]
+            """
+            label_input_seq = torch.full_like(input_seq, fill_value=-1)
+            label_output_segments = []
             ptr = 0
             while ptr < self.length:
                 thread_labels = input_seq[ptr:ptr + self.num_threads]
                 input_labels = input_seq[ptr + 1:ptr + self.num_threads]
-                label_segments.extend([thread_labels, input_labels])
+                label_output_segments.extend([thread_labels, input_labels])
                 ptr += self.num_threads
-            label_seq = torch.cat(label_segments)
-            return torch.cat((label_input_seq, label_seq))
+            label_output_seq = torch.cat(label_output_segments)
+            return torch.cat((label_input_seq, label_output_seq))
         
         def generate_thread_mask(input_seq):
+            """ 
+            create a mask that allows each thread to attend to the correct tokens
+            - start with causal mask for all tokens
+            - then ensure that no token attends backward to special tokens outside of the local decoding group
+            - for the local decoding groups select the mask type based on the thread_mask_type parameter
+            """
             sep_id = self.num_digits
             thread_tokens = torch.arange(sep_id + 1, sep_id + 1 + self.extra_threads, dtype=torch.long)
             output_segments = get_output_seq_segments(input_seq)
